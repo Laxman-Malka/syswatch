@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdio>
 #include <stdio.h>
 #include <sys/ptrace.h>
 #include <string.h>
@@ -13,7 +14,6 @@
 #include <cctype>          // isprint
 #include <algorithm>
 #define PTRACE(req, ...) ptrace(static_cast<__ptrace_request>(req), __VA_ARGS__)
-#pragma once
 #include <sys/uio.h>
 #include <unistd.h>
 #include <cerrno>
@@ -43,7 +43,7 @@ inline ssize_t read_child_memory(
 
 struct IntArg {
     static void print(pid_t, ptrace_syscall_info* info, size_t i) {
-        printf("%lld", (long long)info->entry.args[i]);
+        fprintf(LOG_FILE, "%lld", (long long)info->entry.args[i]);
     }
 };
 
@@ -51,13 +51,13 @@ struct IntArg {
 
 struct SizeArg {
     static void print(pid_t, ptrace_syscall_info* info, size_t i) {
-        printf("%llu", (unsigned long long)info->entry.args[i]);
+        fprintf(LOG_FILE, "%llu", (unsigned long long)info->entry.args[i]);
     }
 };
 
 struct PtrArg {
     static void print(pid_t, ptrace_syscall_info* info,size_t i) {
-        printf("0x%llx", static_cast<unsigned long long>(info->entry.args[i]));
+        fprintf(LOG_FILE, "0x%llx", static_cast<unsigned long long>(info->entry.args[i]));
     }
 };
 
@@ -71,7 +71,7 @@ struct CStringArg {
         unsigned long long addr = info->entry.args[i];
 
         if (!addr) {
-            printf("NULL");
+            fprintf(LOG_FILE, "NULL");
             return;
         }
 
@@ -87,7 +87,7 @@ struct CStringArg {
 
             if (n <= 0) {
                 if (buffer.empty()) {
-                    printf("<invalid ptr>");
+                    fprintf(LOG_FILE, "<invalid ptr>");
                     return;
                 }
                 break;
@@ -107,32 +107,32 @@ struct CStringArg {
         }
 
         print_sanitized(buffer.data(), buffer.size());
-        printf("...");
+        fprintf(LOG_FILE, "...");
     }
 
 private:
     static void print_sanitized(const char* data, size_t len) {
-        printf("\"");
+        fprintf(LOG_FILE, "\"");
 
         for (size_t k = 0; k < len; k++) {
             unsigned char c = data[k];
 
             switch (c) {
-                case '\n': printf("\\n"); break;
-                case '\t': printf("\\t"); break;
-                case '\r': printf("\\r"); break;
-                case '\\': printf("\\\\"); break;
-                case '"':  printf("\\\""); break;
+                case '\n': fprintf(LOG_FILE, "\\n"); break;
+                case '\t': fprintf(LOG_FILE, "\\t"); break;
+                case '\r': fprintf(LOG_FILE, "\\r"); break;
+                case '\\': fprintf(LOG_FILE, "\\\\"); break;
+                case '"':  fprintf(LOG_FILE, "\\\""); break;
 
                 default:
                     if (isprint(c))
-                        putchar(c);
+                        fputc(c,LOG_FILE);
                     else
-                        printf("\\x%02x", c);
+                        fprintf(LOG_FILE, "\\x%02x", c);
             }
         }
 
-        printf("\"");
+        fprintf(LOG_FILE, "\"");
     }
 };
 
@@ -145,12 +145,12 @@ struct BufferArg {
         size_t len = info->entry.args[LenIndex];
 
         if (!addr) {
-            printf("NULL");
+            fprintf(LOG_FILE, "NULL");
             return;
         }
 
         if (len == 0) {
-            printf("\"\"");
+            fprintf(LOG_FILE, "\"\"");
             return;
         }
 
@@ -159,7 +159,7 @@ struct BufferArg {
         ssize_t n = read_child_memory(pid, buffer.data(), addr, len);
 
         if (n <= 0) {
-            printf("<invalid ptr>");
+            fprintf(LOG_FILE, "<invalid ptr>");
             return;
         }
 
@@ -168,26 +168,26 @@ struct BufferArg {
 
 private:
     static void print_sanitized(const char* data, size_t len) {
-        printf("\"");
+        fprintf(LOG_FILE, "\"");
 
         for (size_t k = 0; k < len; k++) {
             unsigned char c = data[k];
 
             switch (c) {
-                case '\n': printf("\\n"); break;
-                case '\t': printf("\\t"); break;
-                case '\r': printf("\\r"); break;
-                case '\\': printf("\\\\"); break;
-                case '"':  printf("\\\""); break;
+                case '\n': fprintf(LOG_FILE, "\\n"); break;
+                case '\t': fprintf(LOG_FILE, "\\t"); break;
+                case '\r': fprintf(LOG_FILE, "\\r"); break;
+                case '\\': fprintf(LOG_FILE, "\\\\"); break;
+                case '"':  fprintf(LOG_FILE, "\\\""); break;
 
                 default:
                     if (isprint(c))
-                        putchar(c);
+                        fputc(c,LOG_FILE);
                     else
-                        printf("\\x%02x", c);
+                        fprintf(LOG_FILE, "\\x%02x", c);
             }
         }
 
-        printf("\"");
+        fprintf(LOG_FILE, "\"");
     }
 };

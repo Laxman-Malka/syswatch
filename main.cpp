@@ -1,3 +1,4 @@
+#include <cstdio>
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -14,12 +15,34 @@
 #include <linux/ptrace.h>
 
 #include "core/dispatcher.hpp"
-#include "core/types.hpp"
+#include "core/process.hpp"
+#include "core/config.hpp"
 
 // register syscalls
-#include "syscalls/write.hpp"
 #include "syscalls/open.hpp"
+#include "syscalls/openat.hpp"
+#include "syscalls/read.hpp"
+#include "syscalls/write.hpp"
+#include "syscalls/close.hpp"
 
+#include "syscalls/socket.hpp"
+#include "syscalls/connect.hpp"
+#include "syscalls/accept.hpp"
+#include "syscalls/accept4.hpp"
+#include "syscalls/sendto.hpp"
+#include "syscalls/recvfrom.hpp"   
+#include "syscalls/sendmsg.hpp"
+#include "syscalls/recvmsg.hpp"
+#include "syscalls/socketpair.hpp"
+
+#include "syscalls/dup.hpp"
+#include "syscalls/dup2.hpp"
+#include "syscalls/dup3.hpp"
+#include "syscalls/pipe.hpp"
+#include "syscalls/pipe2.hpp"
+#include "syscalls/generated_syscalls.hpp"
+#include "core/cli.hpp"
+#include "core/rules.hpp"
 // for cpp type correctness
 #define PTRACE(req, ...) ptrace(static_cast<__ptrace_request>(req), __VA_ARGS__)
 /* EXITKILL only for spawned processes — never for attach */
@@ -67,7 +90,7 @@ static void tracee_remove(pid_t pid)
 /* ── detach all live tracees ── */
 static void detach_all(void)
 {
-    fprintf(stderr, "[tracer] detaching %d tracee(s)...\n", g_tracee_count);
+    LOG(1, "[tracer] detaching %d tracee(s)...\n", g_tracee_count);
 
     for (int i = 0; i < g_tracee_count; i++)
     {
@@ -137,7 +160,7 @@ static int attach_process(pid_t *pids, int count)
     {
         if (attach_one(pids[i]) == 0)
         {
-            fprintf(stderr, "[tracer] attached to pid %d\n", pids[i]);
+            LOG(1, "[tracer] attached to pid %d\n", pids[i]);
             ok++;
         }
     }
@@ -176,8 +199,6 @@ static pid_t spawn_process(char *argv[])
     return child;
 }
 
-
-
 /* ── handle fork/clone/exec events ── */
 static int handle_event(pid_t pid, int status)
 {
@@ -196,33 +217,52 @@ static int handle_event(pid_t pid, int status)
     switch (event)
     {
     case PTRACE_EVENT_FORK:
-        fprintf(stderr, "[pid %d] fork -> %lu\n", pid, newpid);
+        LOG(1, "[pid %d] fork -> %lu\n", pid, newpid);
         break;
+
     case PTRACE_EVENT_VFORK:
-        fprintf(stderr, "[pid %d] vfork -> %lu\n", pid, newpid);
+        LOG(1, "[pid %d] vfork -> %lu\n", pid, newpid);
         break;
+
     case PTRACE_EVENT_CLONE:
-        fprintf(stderr, "[pid %d] clone -> %lu\n", pid, newpid);
+        LOG(1, "[pid %d] clone -> %lu\n", pid, newpid);
         break;
+
     case PTRACE_EVENT_EXEC:
-        fprintf(stderr, "[pid %d] exec (old tid %lu)\n", pid, newpid);
+        LOG(1, "[pid %d] exec (old tid %lu)\n", pid, newpid);
         return 1;
+
     case PTRACE_EVENT_EXIT:
-        fprintf(stderr, "[pid %d] about to exit (status=%lu)\n", pid, newpid);
+        LOG(1, "[pid %d] about to exit (status=%lu)\n", pid, newpid);
         return 1;
+
     default:
         return 0;
     }
 
+    // 🔥 CRITICAL FIX: properly initialize new tracee
     if (newpid > 0)
     {
-        tracee_add((pid_t)newpid);
+        pid_t np = (pid_t)newpid;
 
-        if (PTRACE(PTRACE_SYSCALL, (pid_t)newpid, 0, 0) == -1)
+        tracee_add(np);
+
+        int opts = g_attached ? PTRACE_OPTS_ATTACH : PTRACE_OPTS_SPAWN;
+
+        // 🔥 ensure child inherits correct tracing behavior
+        if (PTRACE(PTRACE_SETOPTIONS, np, 0, opts) == -1)
         {
             fprintf(stderr,
-                    "PTRACE_SYSCALL(new %lu): %s\n",
-                    newpid, strerror(errno));
+                    "PTRACE_SETOPTIONS(new %d): %s\n",
+                    np, strerror(errno));
+        }
+
+        // 🔥 resume child in syscall-tracing mode
+        if (PTRACE(PTRACE_SYSCALL, np, 0, 0) == -1)
+        {
+            fprintf(stderr,
+                    "PTRACE_SYSCALL(new %d): %s\n",
+                    np, strerror(errno));
         }
     }
 
@@ -235,43 +275,38 @@ static int handle_stop(pid_t pid, int status)
     if (!WIFSTOPPED(status))
         return 0;
 
-    if (handle_event(pid, status))
-        return 0;
-
     int sig = WSTOPSIG(status);
 
+    // ✅ syscall-stop (TRACESYSGOOD)
     if (sig == (SIGTRAP | 0x80))
     {
         struct ptrace_syscall_info info;
         memset(&info, 0, sizeof(info));
 
-        if (PTRACE(PTRACE_GET_SYSCALL_INFO, pid,
-                   sizeof(info), &info) == -1)
+        if (PTRACE(PTRACE_GET_SYSCALL_INFO, pid, sizeof(info), &info) == -1)
         {
             perror("PTRACE_GET_SYSCALL_INFO");
             return -1;
         }
+
+        // 🔥 CRITICAL SPLIT
         if (info.op == PTRACE_SYSCALL_INFO_ENTRY)
+        {
             dispatch_entry(pid, &info);
+        }
         else if (info.op == PTRACE_SYSCALL_INFO_EXIT)
+        {
             dispatch_exit(pid, &info);
+        }
 
         return 0;
     }
 
-    /* swallow ptrace SIGTRAP */
-    /* swallow ONLY pure ptrace traps */
+    // plain SIGTRAP (ignore)
     if (sig == SIGTRAP)
-    {
-        /* distinguish real vs internal */
-        if ((status >> 16) != 0)
-            return 0; // ptrace event
+        return 0;
 
-        /* otherwise forward real SIGTRAP */
-        return SIGTRAP;
-    }
-
-    /* forward real signals */
+    // pass other signals through
     return sig;
 }
 
@@ -305,7 +340,7 @@ static void trace_loop(pid_t *initial, int count)
             }
             if (errno == ECHILD)
             {
-                fprintf(stderr, "[tracer] no more processes\n");
+                LOG(1, "[tracer] no more processes\n");
                 break;
             }
             perror("waitpid");
@@ -314,14 +349,14 @@ static void trace_loop(pid_t *initial, int count)
 
         if (WIFEXITED(status))
         {
-            fprintf(stderr, "[pid %d] exited (%d)\n", pid, WEXITSTATUS(status));
+            LOG(1, "[pid %d] exited (%d)\n", pid, WEXITSTATUS(status));
             tracee_remove(pid);
             continue;
         }
 
         if (WIFSIGNALED(status))
         {
-            fprintf(stderr, "[pid %d] killed by signal %d (%s)\n",
+            LOG(1, "[pid %d] killed by signal %d (%s)\n",
                     pid, WTERMSIG(status), strsignal(WTERMSIG(status)));
             tracee_remove(pid);
             continue;
@@ -329,7 +364,19 @@ static void trace_loop(pid_t *initial, int count)
 
         if (!WIFSTOPPED(status))
             continue;
-
+        // 🔥 FIRST handle ptrace events (fork/clone/exec)
+        if (handle_event(pid, status))
+        {
+            // still need to resume parent
+            if (PTRACE(PTRACE_SYSCALL, pid, 0, 0) == -1)
+            {
+                if (errno == ESRCH)
+                    continue;
+                perror("PTRACE_SYSCALL");
+                break;
+            }
+            continue;
+        }
         int sig = handle_stop(pid, status);
         if (sig == -1)
             break;
@@ -351,66 +398,85 @@ static void trace_loop(pid_t *initial, int count)
 /* ── main ── */
 int main(int argc, char *argv[])
 {
+    CLIOptions opts;
 
-    if (argc < 2)
-    {
-        fprintf(stderr,
-                "Usage:\n"
-                "  %s <program> [args...]\n"
-                "  %s -p <pid> [pid...]\n",
-                argv[0], argv[0]);
+    if (!parse_cli(argc, argv, opts))
         return 1;
+
+    // 🔥 logging setup
+    LOG_LEVEL = opts.log_level;
+
+    if (opts.log_file)
+    {
+        LOG_FILE = fopen(opts.log_file, "a");
+
+        if (!LOG_FILE)
+        {
+            perror("fopen(log)");
+            return 1;
+        }
     }
 
+    // 🔥 load rules
+    rules::load_rules(opts.rules_file);
+
+    // 🔥 signals
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    if (strcmp(argv[1], "-p") == 0)
+    // ─────────────────────────────────────────────
+    // ATTACH MODE
+    // ─────────────────────────────────────────────
+    if (opts.attach_mode)
     {
-        if (argc < 3)
-        {
-            fprintf(stderr, "Missing PID\n");
-            return 1;
-        }
-
         g_attached = 1;
 
-        int count = argc - 2;
-        pid_t *pids = static_cast<pid_t *>(malloc(count * sizeof(pid_t)));
-        if (!pids)
+        int count = (int)opts.pids.size();
+
+        if (count <= 0)
         {
-            perror("malloc");
+            fprintf(stderr, "No pid specified\n");
+
+            if (LOG_FILE && LOG_FILE != stderr)
+                fclose(LOG_FILE);
+
             return 1;
         }
 
-        for (int i = 0; i < count; i++)
+        if (attach_process(opts.pids.data(), count) == -1)
         {
-            pids[i] = (pid_t)atoi(argv[2 + i]);
-            if (pids[i] <= 0)
-            {
-                fprintf(stderr, "Invalid pid: %s\n", argv[2 + i]);
-                free(pids);
-                return 1;
-            }
-        }
+            if (LOG_FILE && LOG_FILE != stderr)
+                fclose(LOG_FILE);
 
-        if (attach_process(pids, count) == -1)
-        {
-            free(pids);
             return 1;
         }
 
-        trace_loop(pids, count);
-        free(pids);
+        trace_loop(opts.pids.data(), count);
     }
+
+    // ─────────────────────────────────────────────
+    // SPAWN MODE
+    // ─────────────────────────────────────────────
     else
     {
         g_attached = 0;
-        pid_t child = spawn_process(&argv[1]);
+
+        pid_t child = spawn_process(opts.program_argv);
+
         if (child == -1)
+        {
+            if (LOG_FILE && LOG_FILE != stderr)
+                fclose(LOG_FILE);
+
             return 1;
+        }
+
         trace_loop(&child, 1);
     }
+
+    // 🔥 cleanup
+    if (LOG_FILE && LOG_FILE != stderr)
+        fclose(LOG_FILE);
 
     return 0;
 }

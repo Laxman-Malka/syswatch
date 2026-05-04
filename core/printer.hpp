@@ -1,8 +1,10 @@
 #pragma once
+#include <cstdio>
 #include <linux/ptrace.h>
 #include "types.hpp"
 #include<cstdio>
 #include "concepts.hpp"
+#include "config.hpp"
 // PRIMARY TEMPLATE (must include variadic args!)
 template<size_t I, typename... Args>
 struct ArgPrinter;
@@ -20,7 +22,7 @@ struct ArgPrinter<I, First, Rest...> {
         First::print(pid, info, I);
 
         if constexpr (sizeof...(Rest) > 0) {
-            printf(", ");
+            fprintf(LOG_FILE, ", ");
             ArgPrinter<I + 1, Rest...>::print(pid, info);
         }
     }
